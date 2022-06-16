@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"fmt"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
 )
@@ -59,13 +60,24 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
+	hs, _, err := storage.InitialState()
+	if err != nil {
+		panic(err.Error())
+	}
+	fi, _ := storage.FirstIndex()
+	li, _ := storage.LastIndex()
 	l := &RaftLog{
 		storage:         storage,
-		committed:       0,
+		committed:       hs.Commit,
 		applied:         0,
-		stabled:         0,
-		entries:         nil,
+		stabled:         li,
+		entries:         make([]pb.Entry, 0),
 		pendingSnapshot: nil,
+	}
+	ents, err := storage.Entries(fi, li+1)
+	//log.Debugf("NewLog storage Entries %v", ents)
+	for _, ent := range ents {
+		l.entries = append(l.entries, ent)
 	}
 	sn, err := storage.Snapshot()
 	for err == ErrSnapshotTemporarilyUnavailable {
@@ -87,24 +99,67 @@ func (l *RaftLog) maybeCompact() {
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	// Your Code Here (2A).
-	return nil
+	if len(l.entries) > 0 {
+		si := l.physicalIndex(l.stabled)
+		return l.entries[si+1:]
+	}
+	return []pb.Entry{}
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	// Your Code Here (2A).
-	return nil
+	if len(l.entries) > 0 {
+		ai := l.physicalIndex(l.applied)
+		ci := l.physicalIndex(l.committed)
+		return l.entries[ai+1 : ci+1]
+	}
+	return []pb.Entry{}
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	li, _ := l.storage.LastIndex()
-	return li
+	if len(l.entries) > 0 {
+		return l.entries[len(l.entries)-1].Index
+	}
+	return 0
+}
+
+// LastTerm return the last term of the log entries
+func (l *RaftLog) LastTerm() uint64 {
+	if len(l.entries) > 0 {
+		return l.entries[len(l.entries)-1].Term
+	}
+	return 0
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	// Your Code Here (2A).
-	return 0, nil
+	i = l.physicalIndex(i)
+	if i < 0 || i >= uint64(len(l.entries)) {
+		return 0, fmt.Errorf("illegal log index %v (physical)", i)
+	}
+	return l.entries[i].Term, nil
+}
+
+func (l *RaftLog) EntsAfter(i uint64) (ents []pb.Entry) {
+	i = l.physicalIndex(i)
+	if i < uint64(len(l.entries)) {
+		return l.entries[i:]
+	}
+	return []pb.Entry{}
+}
+
+func (l *RaftLog) DropEnts(i uint64) {
+	if i <= l.committed {
+		panic("can not drop committed entries")
+	}
+	i = l.physicalIndex(i)
+	if i < uint64(len(l.entries)) {
+		l.entries = l.entries[:i]
+		l.stabled = min(l.stabled, uint64(len(l.entries)))
+	}
+}
+
+func (l *RaftLog) physicalIndex(i uint64) uint64 {
+	return i - 1
 }
