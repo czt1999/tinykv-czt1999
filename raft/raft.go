@@ -186,10 +186,20 @@ func newRaft(c *Config) *Raft {
 		leadTransferee:   0,
 		PendingConfIndex: 0,
 	}
+	r.RaftLog.applied = c.Applied
 	for _, peer := range c.peers {
 		r.Prs[peer] = &Progress{Match: 0, Next: 1}
 	}
 	return r
+}
+
+// HardState return the current hard state
+func (r *Raft) HardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
 }
 
 func (r *Raft) bcastAppend() {
