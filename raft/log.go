@@ -17,7 +17,6 @@ package raft
 import (
 	"fmt"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
-	"time"
 )
 
 // RaftLog manage the log entries, its struct look like:
@@ -79,14 +78,15 @@ func newLog(storage Storage) *RaftLog {
 	for _, ent := range ents {
 		l.entries = append(l.entries, ent)
 	}
-	sn, err := storage.Snapshot()
-	for err == ErrSnapshotTemporarilyUnavailable {
-		time.Sleep(10 * time.Millisecond)
-		sn, err = storage.Snapshot()
-	}
-	if err != nil {
-		sn.GetData()
-	}
+	// @TODO
+	//sn, err := storage.Snapshot()
+	//for err == ErrSnapshotTemporarilyUnavailable {
+	//	time.Sleep(10 * time.Millisecond)
+	//	sn, err = storage.Snapshot()
+	//}
+	//if err == nil {
+	//	sn.GetData()
+	//}
 	return l
 }
 

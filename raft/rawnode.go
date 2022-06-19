@@ -16,8 +16,6 @@ package raft
 
 import (
 	"errors"
-	"github.com/pingcap-incubator/tinykv/log"
-
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -164,9 +162,6 @@ func (rn *RawNode) Ready() Ready {
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
-	// Your Code Here (2A).
-	log.Debugf("HasReady lastAdvc(%d %d) RaftLog(%d %d)",
-		rn.lastAdvc, rn.Raft.RaftLog.LastIndex(), rn.lastAdvcCommit, rn.Raft.RaftLog.committed)
 	if rn.lastAdvc < rn.Raft.RaftLog.LastIndex() || rn.lastAdvcCommit < rn.Raft.RaftLog.committed {
 		return true
 	}
