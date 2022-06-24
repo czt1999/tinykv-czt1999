@@ -2,6 +2,8 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -38,11 +40,80 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
+func (d *peerMsgHandler) NewCmdRespFromReq(req *raft_cmdpb.Request, cb *message.Callback) *raft_cmdpb.RaftCmdResponse {
+	resp := newCmdResp()
+	resp.Header.CurrentTerm = d.Term()
+	resp.Responses = []*raft_cmdpb.Response{{CmdType: req.CmdType}}
+	switch req.CmdType {
+	case raft_cmdpb.CmdType_Get:
+		resp.Responses[0].Get = &raft_cmdpb.GetResponse{}
+		val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, engine_util.CfDefault, req.Get.Key)
+		if err != nil {
+			log.Errorf("Request Get error %v", err)
+			return resp
+		}
+		resp.Responses[0].Get.Value = val
+	case raft_cmdpb.CmdType_Snap:
+		resp.Responses[0].Snap = &raft_cmdpb.SnapResponse{
+			Region: d.Region(),
+		}
+		cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+	case raft_cmdpb.CmdType_Put:
+	case raft_cmdpb.CmdType_Delete:
+	}
+	return resp
+}
+
 func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
 	// Your Code Here (2B).
+	rd := d.RaftGroup.Ready()
+	// persist states and entries and apply entries if any
+	_, err := d.peerStorage.SaveReadyState(&rd)
+	if err != nil {
+		panic(err)
+	}
+	// deal with callbacks in terms of applied entries
+	applied := make(map[uint64]*pb.Entry, 0)
+	for i := range rd.CommittedEntries {
+		ent := rd.CommittedEntries[i]
+		applied[ent.Index] = &ent
+	}
+	remainedProposals := make([]*proposal, 0)
+	for _, pro := range d.proposals {
+		if ent, ok := applied[pro.index]; ok && ent.Term == pro.term {
+			req := &raft_cmdpb.Request{}
+			if err := req.Unmarshal(ent.Data); err != nil {
+				panic(err)
+			}
+			resp := d.NewCmdRespFromReq(req, pro.cb)
+			if req.CmdType == raft_cmdpb.CmdType_Put {
+				log.Debugf("Put done (%v) %s %s", pro.index, req.Put.Key, req.Put.Value)
+			}
+			//if req.CmdType == raft_cmdpb.CmdType_Snap {
+			//	start := resp.Responses[0].Snap.Region.GetStartKey()
+			//	end := resp.Responses[0].Snap.Region.GetEndKey()
+			//	log.Infof("Snap done (%v) %s %s", pro.index, start, end)
+			//}
+			pro.cb.Done(resp)
+		} else if ok && ent.Term != pro.term {
+			// leader may have been changed
+			regionID := d.regionId
+			leaderID := d.LeaderId()
+			leader := d.getPeerFromCache(leaderID)
+			pro.cb.Done(ErrResp(&util.ErrNotLeader{RegionId: regionID, Leader: leader}))
+		} else {
+			remainedProposals = append(remainedProposals, pro)
+		}
+	}
+	d.proposals = remainedProposals
+	// send messages if any
+	for _, msg := range rd.Messages {
+		d.sendRaftMessage(msg, d.ctx.trans)
+	}
+	d.RaftGroup.Advance(rd)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -114,6 +185,27 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	log.Debugf("peerMsgHandler proposeRaftCommand requests:%v", msg.Requests)
+
+	if len(msg.Requests) > 0 {
+		req := msg.Requests[0]
+		data, err := req.Marshal()
+		if err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+		d.proposals = append(d.proposals, &proposal{
+			index: d.nextProposalIndex(),
+			term:  d.Term(),
+			cb:    cb,
+		})
+		//log.Debugf("proposeRaftCommand new proposal %v %v %v", req.CmdType, d.nextProposalIndex(), data)
+		err = d.RaftGroup.Propose(data)
+		if err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+	}
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -162,8 +254,8 @@ func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
 }
 
 func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
-	log.Debugf("%s handle raft message %s from %d to %d",
-		d.Tag, msg.GetMessage().GetMsgType(), msg.GetFromPeer().GetId(), msg.GetToPeer().GetId())
+	//log.Debugf("%s handle raft message %s from %d to %d",
+	//	d.Tag, msg.GetMessage().GetMsgType(), msg.GetFromPeer().GetId(), msg.GetToPeer().GetId())
 	if !d.validateRaftMessage(msg) {
 		return nil
 	}
@@ -208,9 +300,9 @@ func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 // return false means the message is invalid, and can be ignored.
 func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	regionID := msg.GetRegionId()
-	from := msg.GetFromPeer()
+	//from := msg.GetFromPeer()
 	to := msg.GetToPeer()
-	log.Debugf("[region %d] handle raft message %s from %d to %d", regionID, msg, from.GetId(), to.GetId())
+	//log.Debugf("[region %d] handle raft message %s from %d to %d", regionID, msg, from.GetId(), to.GetId())
 	if to.GetStoreId() != d.storeID() {
 		log.Warnf("[region %d] store not match, to store id %d, mine %d, ignore it",
 			regionID, to.GetStoreId(), d.storeID())

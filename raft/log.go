@@ -16,6 +16,7 @@ package raft
 
 import (
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -53,6 +54,9 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	first uint64
+
+	termBeforeFirst uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -70,23 +74,17 @@ func newLog(storage Storage) *RaftLog {
 		committed:       hs.Commit,
 		applied:         0,
 		stabled:         li,
+		first:           fi,
 		entries:         make([]pb.Entry, 0),
 		pendingSnapshot: nil,
 	}
 	ents, err := storage.Entries(fi, li+1)
-	//log.Debugf("NewLog storage Entries %v", ents)
-	for _, ent := range ents {
-		l.entries = append(l.entries, ent)
+	if err != nil {
+		panic(err.Error())
 	}
-	// @TODO
-	//sn, err := storage.Snapshot()
-	//for err == ErrSnapshotTemporarilyUnavailable {
-	//	time.Sleep(10 * time.Millisecond)
-	//	sn, err = storage.Snapshot()
-	//}
-	//if err == nil {
-	//	sn.GetData()
-	//}
+	l.termBeforeFirst, _ = storage.Term(fi - 1)
+	log.Debugf("NewLog storage FirstIndex %v LastIndex %v", fi, li)
+	l.entries = append(l.entries, ents...)
 	return l
 }
 
@@ -100,8 +98,14 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	if len(l.entries) > 0 {
-		si := l.physicalIndex(l.stabled)
-		return l.entries[si+1:]
+		si := l.physicalIndex(l.stabled + 1)
+		if si > l.stabled {
+			log.Panicf("stabled %v, first %v", l.stabled, l.first)
+		}
+		if si > uint64(len(l.entries)) {
+			log.Panicf("stabled %v, first %v, len(entries) %v, LastIndex %v", l.stabled, l.first, len(l.entries), l.LastIndex())
+		}
+		return l.entries[si:]
 	}
 	return []pb.Entry{}
 }
@@ -109,9 +113,9 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	if len(l.entries) > 0 {
-		ai := l.physicalIndex(l.applied)
-		ci := l.physicalIndex(l.committed)
-		return l.entries[ai+1 : ci+1]
+		ai := l.physicalIndex(l.applied + 1)
+		ci := l.physicalIndex(l.committed + 1)
+		return l.entries[ai:ci]
 	}
 	return []pb.Entry{}
 }
@@ -121,7 +125,7 @@ func (l *RaftLog) LastIndex() uint64 {
 	if len(l.entries) > 0 {
 		return l.entries[len(l.entries)-1].Index
 	}
-	return 0
+	return l.first - 1
 }
 
 // LastTerm return the last term of the log entries
@@ -129,13 +133,16 @@ func (l *RaftLog) LastTerm() uint64 {
 	if len(l.entries) > 0 {
 		return l.entries[len(l.entries)-1].Term
 	}
-	return 0
+	return l.termBeforeFirst
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
+	if i < l.first {
+		return l.termBeforeFirst, nil
+	}
 	i = l.physicalIndex(i)
-	if i < 0 || i >= uint64(len(l.entries)) {
+	if i >= uint64(len(l.entries)) {
 		return 0, fmt.Errorf("illegal log index %v (physical)", i)
 	}
 	return l.entries[i].Term, nil
@@ -151,15 +158,15 @@ func (l *RaftLog) EntsAfter(i uint64) (ents []pb.Entry) {
 
 func (l *RaftLog) DropEnts(i uint64) {
 	if i <= l.committed {
-		panic("can not drop committed entries")
+		log.Panicf("can not drop committed entries %v %v", i, l.committed)
 	}
 	i = l.physicalIndex(i)
 	if i < uint64(len(l.entries)) {
 		l.entries = l.entries[:i]
-		l.stabled = min(l.stabled, uint64(len(l.entries)))
+		l.stabled = min(l.stabled, l.LastIndex())
 	}
 }
 
 func (l *RaftLog) physicalIndex(i uint64) uint64 {
-	return i - 1
+	return i - l.first
 }

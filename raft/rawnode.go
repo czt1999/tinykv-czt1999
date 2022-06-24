@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"reflect"
 )
 
 // ErrStepLocalMsg is returned when try to step a local raft message
@@ -71,6 +72,7 @@ type RawNode struct {
 	// Your Data Here (2A).
 	lastAdvcCommit uint64
 	lastAdvc       uint64
+	lastHs         pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
@@ -80,6 +82,7 @@ func NewRawNode(c *Config) (*RawNode, error) {
 	}
 	rn.lastAdvcCommit = rn.Raft.RaftLog.applied
 	rn.lastAdvc = rn.Raft.RaftLog.LastIndex()
+	rn.lastHs = rn.Raft.HardState()
 	return rn, nil
 }
 
@@ -97,11 +100,7 @@ func (rn *RawNode) Campaign() error {
 
 // Propose proposes data be appended to the raft log.
 func (rn *RawNode) Propose(data []byte) error {
-	ent := pb.Entry{Data: data}
-	return rn.Raft.Step(pb.Message{
-		MsgType: pb.MessageType_MsgPropose,
-		From:    rn.Raft.id,
-		Entries: []*pb.Entry{&ent}})
+	return rn.Raft.Step(pb.Message{MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: data}}})
 }
 
 // ProposeConfChange proposes a config change.
@@ -147,25 +146,25 @@ func (rn *RawNode) Step(m pb.Message) error {
 
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
-	// Your Code Here (2A).
 	rd := Ready{
 		//SoftState:        &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State},
-		//HardState:        rn.Raft.HardState(),
 		Entries:          rn.Raft.RaftLog.unstableEntries(),
 		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
-		// TODO
 		//Snapshot:         *rn.Raft.RaftLog.pendingSnapshot,
-		//Messages:         nil,
+	}
+	currHs := rn.Raft.HardState()
+	if !reflect.DeepEqual(rn.lastHs, currHs) {
+		rd.HardState = currHs
+	}
+	if len(rn.Raft.msgs) > 0 {
+		rd.Messages = rn.Raft.msgs
 	}
 	return rd
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
-	if rn.lastAdvc < rn.Raft.RaftLog.LastIndex() || rn.lastAdvcCommit < rn.Raft.RaftLog.committed {
-		return true
-	}
-	return false
+	return len(rn.Raft.msgs) > 0 || rn.lastAdvc < rn.Raft.RaftLog.LastIndex() || rn.lastAdvcCommit < rn.Raft.RaftLog.committed
 }
 
 // Advance notifies the RawNode that the application has applied and saved progress in the
@@ -174,10 +173,23 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.Entries) > 0 {
 		rn.lastAdvc = rd.Entries[len(rd.Entries)-1].Index
 		rn.Raft.RaftLog.stabled = rn.lastAdvc
+		rn.Raft.debug("RawNode Advcance update stable %v", rn.Raft.RaftLog.stabled)
 	}
 	if len(rd.CommittedEntries) > 0 {
 		rn.lastAdvcCommit = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+		if rn.lastAdvcCommit > rn.Raft.RaftLog.committed {
+			rn.Raft.debug("rn.lastAdvcCommit > rn.Raft.RaftLog.committed")
+			panic("rn.lastAdvcCommit > rn.Raft.RaftLog.committed")
+		}
 		rn.Raft.RaftLog.applied = rn.lastAdvcCommit
+	}
+	if !reflect.DeepEqual(rd.HardState, pb.HardState{}) {
+		rn.lastHs = rd.HardState
+	}
+	if len(rd.Messages) > 0 {
+		newMsgs := make([]pb.Message, len(rn.Raft.msgs)-len(rd.Messages))
+		copy(newMsgs, rd.Messages)
+		rn.Raft.msgs = newMsgs
 	}
 }
 
