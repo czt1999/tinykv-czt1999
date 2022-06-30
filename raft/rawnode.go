@@ -146,12 +146,7 @@ func (rn *RawNode) Step(m pb.Message) error {
 
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
-	rd := Ready{
-		//SoftState:        &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State},
-		Entries:          rn.Raft.RaftLog.unstableEntries(),
-		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
-		//Snapshot:         *rn.Raft.RaftLog.pendingSnapshot,
-	}
+	rd := Ready{}
 	currHs := rn.Raft.HardState()
 	if !reflect.DeepEqual(rn.lastHs, currHs) {
 		rd.HardState = currHs
@@ -159,6 +154,13 @@ func (rn *RawNode) Ready() Ready {
 	if len(rn.Raft.msgs) > 0 {
 		rd.Messages = rn.Raft.msgs
 	}
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		rd.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	}
+	//} else {
+	rd.Entries = rn.Raft.RaftLog.unstableEntries()
+	rd.CommittedEntries = rn.Raft.RaftLog.nextEnts()
+	//}
 	return rd
 }
 
@@ -172,16 +174,15 @@ func (rn *RawNode) HasReady() bool {
 func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.Entries) > 0 {
 		rn.lastAdvc = rd.Entries[len(rd.Entries)-1].Index
-		rn.Raft.RaftLog.stabled = rn.lastAdvc
-		rn.Raft.debug("RawNode Advcance update stable %v", rn.Raft.RaftLog.stabled)
+		rn.Raft.RaftLog.stabled = max(rn.Raft.RaftLog.stabled, rn.lastAdvc)
+		//rn.Raft.debug("RawNode Advcance update stable %v : %v", rn.Raft.RaftLog.stabled, rd.Entries)
 	}
 	if len(rd.CommittedEntries) > 0 {
 		rn.lastAdvcCommit = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 		if rn.lastAdvcCommit > rn.Raft.RaftLog.committed {
-			rn.Raft.debug("rn.lastAdvcCommit > rn.Raft.RaftLog.committed")
 			panic("rn.lastAdvcCommit > rn.Raft.RaftLog.committed")
 		}
-		rn.Raft.RaftLog.applied = rn.lastAdvcCommit
+		rn.Raft.RaftLog.applied = max(rn.Raft.RaftLog.applied, rn.lastAdvcCommit)
 	}
 	if !reflect.DeepEqual(rd.HardState, pb.HardState{}) {
 		rn.lastHs = rd.HardState
@@ -191,6 +192,15 @@ func (rn *RawNode) Advance(rd Ready) {
 		copy(newMsgs, rd.Messages)
 		rn.Raft.msgs = newMsgs
 	}
+	if rd.Snapshot.Metadata != nil && rn.Raft.RaftLog.pendingSnapshot != nil {
+		snapshot := *rn.Raft.RaftLog.pendingSnapshot
+		if snapshot.Metadata.Index == rd.Snapshot.Metadata.Index {
+			rn.Raft.RaftLog.pendingSnapshot = nil
+		}
+		rn.Raft.RaftLog.stabled = max(rn.Raft.RaftLog.stabled, snapshot.Metadata.Index)
+		rn.Raft.debug("RawNode advance snapshot applied (%v)", snapshot.Metadata.Index)
+	}
+	rn.Raft.RaftLog.maybeCompact()
 }
 
 // GetProgress return the Progress of this node and its peers, if this

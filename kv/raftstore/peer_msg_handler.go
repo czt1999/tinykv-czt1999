@@ -59,7 +59,9 @@ func (d *peerMsgHandler) NewCmdRespFromReq(req *raft_cmdpb.Request, cb *message.
 		}
 		cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
 	case raft_cmdpb.CmdType_Put:
+		resp.Responses[0].Put = &raft_cmdpb.PutResponse{}
 	case raft_cmdpb.CmdType_Delete:
+		resp.Responses[0].Delete = &raft_cmdpb.DeleteResponse{}
 	}
 	return resp
 }
@@ -70,6 +72,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 	// Your Code Here (2B).
 	rd := d.RaftGroup.Ready()
+	prevTruncatedIndex := d.peerStorage.applyState.TruncatedState.Index
 	// persist states and entries and apply entries if any
 	_, err := d.peerStorage.SaveReadyState(&rd)
 	if err != nil {
@@ -85,19 +88,10 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	for _, pro := range d.proposals {
 		if ent, ok := applied[pro.index]; ok && ent.Term == pro.term {
 			req := &raft_cmdpb.Request{}
-			if err := req.Unmarshal(ent.Data); err != nil {
-				panic(err)
+			if err = req.Unmarshal(ent.Data); err == nil {
+				resp := d.NewCmdRespFromReq(req, pro.cb)
+				pro.cb.Done(resp)
 			}
-			resp := d.NewCmdRespFromReq(req, pro.cb)
-			if req.CmdType == raft_cmdpb.CmdType_Put {
-				log.Debugf("Put done (%v) %s %s", pro.index, req.Put.Key, req.Put.Value)
-			}
-			//if req.CmdType == raft_cmdpb.CmdType_Snap {
-			//	start := resp.Responses[0].Snap.Region.GetStartKey()
-			//	end := resp.Responses[0].Snap.Region.GetEndKey()
-			//	log.Infof("Snap done (%v) %s %s", pro.index, start, end)
-			//}
-			pro.cb.Done(resp)
 		} else if ok && ent.Term != pro.term {
 			// leader may have been changed
 			regionID := d.regionId
@@ -112,6 +106,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	// send messages if any
 	for _, msg := range rd.Messages {
 		d.sendRaftMessage(msg, d.ctx.trans)
+	}
+	// schedule gc if necessary
+	truncatedIndex := d.peerStorage.applyState.TruncatedState.Index
+	if len(rd.CommittedEntries) > 0 && truncatedIndex > prevTruncatedIndex {
+		d.ScheduleCompactLog(truncatedIndex)
 	}
 	d.RaftGroup.Advance(rd)
 }
@@ -199,10 +198,26 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			term:  d.Term(),
 			cb:    cb,
 		})
-		//log.Debugf("proposeRaftCommand new proposal %v %v %v", req.CmdType, d.nextProposalIndex(), data)
 		err = d.RaftGroup.Propose(data)
 		if err != nil {
 			cb.Done(ErrResp(err))
+			return
+		}
+	}
+	// admin request
+	if msg.AdminRequest != nil {
+		data, err := msg.AdminRequest.Marshal()
+		if err != nil {
+			log.Errorf("AdminRequest Marshal error")
+			return
+		}
+		d.proposals = append(d.proposals, &proposal{
+			index: d.nextProposalIndex(),
+			term:  d.Term(),
+		})
+		err = d.RaftGroup.Propose(data)
+		if err != nil {
+			log.Errorf("AdminRequest Propose error")
 			return
 		}
 	}

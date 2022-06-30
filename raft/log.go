@@ -57,6 +57,8 @@ type RaftLog struct {
 	first uint64
 
 	termBeforeFirst uint64
+
+	tag uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -70,20 +72,19 @@ func newLog(storage Storage) *RaftLog {
 	fi, _ := storage.FirstIndex()
 	li, _ := storage.LastIndex()
 	l := &RaftLog{
-		storage:         storage,
-		committed:       hs.Commit,
-		applied:         0,
-		stabled:         li,
-		first:           fi,
-		entries:         make([]pb.Entry, 0),
-		pendingSnapshot: nil,
+		storage:   storage,
+		committed: hs.Commit,
+		applied:   fi - 1,
+		stabled:   li,
+		first:     fi,
+		entries:   make([]pb.Entry, 0),
 	}
 	ents, err := storage.Entries(fi, li+1)
+	log.Debugf("NewLog storage FirstIndex %v LastIndex %v", fi, li)
 	if err != nil {
 		panic(err.Error())
 	}
 	l.termBeforeFirst, _ = storage.Term(fi - 1)
-	log.Debugf("NewLog storage FirstIndex %v LastIndex %v", fi, li)
 	l.entries = append(l.entries, ents...)
 	return l
 }
@@ -93,6 +94,28 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	fi, _ := l.storage.FirstIndex()
+	if fi > l.first {
+		t, _ := l.storage.Term(fi - 1)
+		l.compact(fi, t)
+	}
+}
+
+func (l *RaftLog) compact(newFirst uint64, termBefore uint64) {
+	if newFirst > l.first {
+		// compacted entries
+		ents := make([]pb.Entry, 0, len(l.entries))
+		if newFirst-l.first < uint64(len(l.entries)) {
+			ents = append(ents, l.entries[newFirst-l.first:]...)
+		}
+		l.first = newFirst
+		l.termBeforeFirst = termBefore
+		l.stabled = max(l.stabled, newFirst-1)
+		l.committed = max(l.committed, newFirst-1)
+		l.applied = max(l.applied, newFirst-1)
+		l.entries = ents
+		//log.Warnf("[%v] compacted %v", l.tag, fi - 1)
+	}
 }
 
 // unstableEntries return all the unstable entries
@@ -115,6 +138,9 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	if len(l.entries) > 0 {
 		ai := l.physicalIndex(l.applied + 1)
 		ci := l.physicalIndex(l.committed + 1)
+		if ai > l.applied {
+			log.Warnf("invalid applied %v first %v comitted %v", l.applied, l.first, l.committed)
+		}
 		return l.entries[ai:ci]
 	}
 	return []pb.Entry{}
@@ -143,7 +169,7 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	}
 	i = l.physicalIndex(i)
 	if i >= uint64(len(l.entries)) {
-		return 0, fmt.Errorf("illegal log index %v (physical)", i)
+		return 0, fmt.Errorf("illegal log index %v/%v (physical)", i, len(l.entries))
 	}
 	return l.entries[i].Term, nil
 }
@@ -156,7 +182,7 @@ func (l *RaftLog) EntsAfter(i uint64) (ents []pb.Entry) {
 	return []pb.Entry{}
 }
 
-func (l *RaftLog) DropEnts(i uint64) {
+func (l *RaftLog) dropEnts(i uint64) {
 	if i <= l.committed {
 		log.Panicf("can not drop committed entries %v %v", i, l.committed)
 	}
