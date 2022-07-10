@@ -73,6 +73,7 @@ type RawNode struct {
 	lastAdvcCommit uint64
 	lastAdvc       uint64
 	lastHs         pb.HardState
+	lastSs         SoftState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
@@ -147,6 +148,10 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	rd := Ready{}
+	currSs := SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State}
+	if !reflect.DeepEqual(rn.lastSs, currSs) {
+		rd.SoftState = &currSs
+	}
 	currHs := rn.Raft.HardState()
 	if !reflect.DeepEqual(rn.lastHs, currHs) {
 		rd.HardState = currHs
@@ -157,10 +162,8 @@ func (rn *RawNode) Ready() Ready {
 	if rn.Raft.RaftLog.pendingSnapshot != nil {
 		rd.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
 	}
-	//} else {
 	rd.Entries = rn.Raft.RaftLog.unstableEntries()
 	rd.CommittedEntries = rn.Raft.RaftLog.nextEnts()
-	//}
 	return rd
 }
 
@@ -183,6 +186,9 @@ func (rn *RawNode) Advance(rd Ready) {
 			panic("rn.lastAdvcCommit > rn.Raft.RaftLog.committed")
 		}
 		rn.Raft.RaftLog.applied = max(rn.Raft.RaftLog.applied, rn.lastAdvcCommit)
+	}
+	if rd.SoftState != nil {
+		rn.lastSs = *rd.SoftState
 	}
 	if !reflect.DeepEqual(rd.HardState, pb.HardState{}) {
 		rn.lastHs = rd.HardState

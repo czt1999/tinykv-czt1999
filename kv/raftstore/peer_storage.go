@@ -342,7 +342,6 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 
 // Apply the peer with given snapshot
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
-	//log.Debugf("%v begin to apply snapshot", ps.Tag)
 	snapData := new(rspb.RaftSnapshotData)
 	if err := snapData.Unmarshal(snapshot.Data); err != nil {
 		return nil, err
@@ -362,11 +361,19 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return &ApplySnapResult{PrevRegion: prevRegion, Region: ps.region}, nil
 	}
 
+	if snapshot.Metadata.Index <= ps.applyState.AppliedIndex {
+		log.Warnf("%v stale snapshot (%v vs. %v)", ps.Tag, snapshot.Metadata.Index, ps.applyState.AppliedIndex)
+		return &ApplySnapResult{PrevRegion: prevRegion, Region: ps.region}, nil
+	}
+	if util.IsEpochStale(snapData.Region.RegionEpoch, ps.region.RegionEpoch) {
+		log.Warnf("%v stale snapshot region (%v vs. %v)", ps.Tag, snapData.Region.RegionEpoch, ps.region.RegionEpoch)
+		return &ApplySnapResult{PrevRegion: prevRegion, Region: ps.region}, nil
+	}
+
 	// delete stale data
 	if err := ps.clearMeta(kvWB, raftWB); err != nil {
 		return nil, err
 	}
-	// TODO [3A]
 	ps.clearExtraData(snapData.Region)
 
 	ps.raftState.LastIndex = snapshot.Metadata.Index
@@ -375,7 +382,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return nil, err
 	}
 
-	log.Warnf("ApplySnapshot TruncatedState.Index %v TruncatedState.Term %v", snapshot.Metadata.Index, snapshot.Metadata.Term)
+	log.Warnf("%v ApplySnapshot (Meta.Index %v Meta.Term %v Region %v)", ps.Tag, snapshot.Metadata.Index, snapshot.Metadata.Term, snapData.Region)
 	ps.applyState.AppliedIndex = snapshot.Metadata.Index
 	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
 	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
@@ -383,6 +390,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return nil, err
 	}
 
+	ps.region = snapData.Region
 	regionState := &rspb.RegionLocalState{
 		State:  rspb.PeerState_Normal,
 		Region: snapData.Region,
@@ -434,38 +442,61 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		return nil, err
 	}
 
-	// commit
+	// apply
 	for i := range ready.CommittedEntries {
 		if ready.CommittedEntries[i].Index <= ps.applyState.AppliedIndex {
 			continue
 		}
-		req := &raft_cmdpb.Request{}
-		if err = req.Unmarshal(ready.CommittedEntries[i].Data); err == nil {
-			switch req.CmdType {
+		// noop
+		if len(ready.CommittedEntries[i].Data) == 0 {
+			ps.applyState.AppliedIndex = ready.CommittedEntries[i].Index
+			continue
+		}
+		// conf change
+		if ready.CommittedEntries[i].EntryType == eraftpb.EntryType_EntryConfChange {
+			ps.applyState.AppliedIndex = ready.CommittedEntries[i].Index
+			continue
+		}
+		cmd := &raft_cmdpb.RaftCmdRequest{}
+		if err = cmd.Unmarshal(ready.CommittedEntries[i].Data); err != nil {
+			log.Panicf("cmd unmarshal error %v", err)
+		}
+		// check region version
+		if cmd.Header.RegionEpoch != nil && cmd.Header.RegionEpoch.Version != ps.region.RegionEpoch.Version {
+			ps.applyState.AppliedIndex = ready.CommittedEntries[i].Index
+			continue
+		}
+		// common request
+		if len(cmd.Requests) > 0 {
+			switch cmd.Requests[0].CmdType {
 			case raft_cmdpb.CmdType_Put:
-				kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+				put := cmd.Requests[0].Put
+				if util.CheckKeyInRegion(put.Key, ps.region) == nil {
+					kvWB.SetCF(put.Cf, put.Key, put.Value)
+				}
 			case raft_cmdpb.CmdType_Delete:
-				kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+				del := cmd.Requests[0].Delete
+				if util.CheckKeyInRegion(del.Key, ps.region) == nil {
+					kvWB.DeleteCF(del.Cf, del.Key)
+				}
 			}
 			ps.applyState.AppliedIndex = ready.CommittedEntries[i].Index
 			continue
 		}
 		// admin request
-		adminReq := &raft_cmdpb.AdminRequest{}
-		if err = adminReq.Unmarshal(ready.CommittedEntries[i].Data); err == nil {
-			switch adminReq.CmdType {
+		if cmd.AdminRequest != nil {
+			switch cmd.AdminRequest.CmdType {
 			case raft_cmdpb.AdminCmdType_CompactLog:
-				if ps.applyState.TruncatedState.Index < adminReq.CompactLog.CompactIndex {
-					ps.applyState.TruncatedState.Term = adminReq.CompactLog.CompactTerm
-					ps.applyState.TruncatedState.Index = adminReq.CompactLog.CompactIndex
-					kvWB := new(engine_util.WriteBatch)
-					if err = kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState); err != nil {
-						log.Error(err)
-					}
+				compact := cmd.AdminRequest.CompactLog
+				if ps.applyState.TruncatedState.Index < compact.CompactIndex {
+					ps.applyState.TruncatedState.Term = compact.CompactTerm
+					ps.applyState.TruncatedState.Index = compact.CompactIndex
 				}
 			}
 			ps.applyState.AppliedIndex = ready.CommittedEntries[i].Index
+			continue
 		}
+		log.Panicf("unknown commit case %v", ready.CommittedEntries[i])
 	}
 	err = kvWB.SetMeta(meta.ApplyStateKey(ps.region.GetId()), ps.applyState)
 	if err != nil {

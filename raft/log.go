@@ -82,6 +82,7 @@ func newLog(storage Storage) *RaftLog {
 	ents, err := storage.Entries(fi, li+1)
 	log.Debugf("NewLog storage FirstIndex %v LastIndex %v", fi, li)
 	if err != nil {
+		log.Panicf("NewLog storage FirstIndex %v LastIndex %v err %v", fi, li, err)
 		panic(err.Error())
 	}
 	l.termBeforeFirst, _ = storage.Term(fi - 1)
