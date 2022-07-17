@@ -538,7 +538,7 @@ func (r *Raft) mayIncreaseCommitted() {
 		}
 	}
 	if newCommitted > r.RaftLog.committed {
-		r.debug("increase committed %v", newCommitted)
+		//r.debug("increase committed %v", newCommitted)
 		r.RaftLog.committed = newCommitted
 		r.bcastAppend()
 	}

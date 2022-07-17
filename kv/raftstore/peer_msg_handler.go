@@ -32,7 +32,8 @@ const (
 
 type peerMsgHandler struct {
 	*peer
-	ctx *GlobalContext
+	ctx          *GlobalContext
+	splitNewPeer *peer
 }
 
 func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
@@ -42,8 +43,9 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
-func (d *peerMsgHandler) checkApplied(rd *raft.Ready) map[uint64]*pb.Entry {
+func (d *peerMsgHandler) checkApplied(rd *raft.Ready) (map[uint64]*pb.Entry, *raft_cmdpb.RaftCmdRequest) {
 	applied := make(map[uint64]*pb.Entry, 0)
+	var split *raft_cmdpb.RaftCmdRequest
 	for i := range rd.CommittedEntries {
 		ent := rd.CommittedEntries[i]
 		applied[ent.Index] = &ent
@@ -60,14 +62,16 @@ func (d *peerMsgHandler) checkApplied(rd *raft.Ready) map[uint64]*pb.Entry {
 		cmd := &raft_cmdpb.RaftCmdRequest{}
 		if err := cmd.Unmarshal(ent.Data); err == nil {
 			if cmd.AdminRequest != nil && cmd.AdminRequest.Split != nil {
-				d.mayApplySplit(cmd)
+				split = cmd
+				//d.mayApplySplit(split)
 			}
 		}
 	}
-	return applied
+	return applied, split
 }
 
-func (d *peerMsgHandler) newCmdRespFromReq(req *raft_cmdpb.Request, cb *message.Callback) *raft_cmdpb.RaftCmdResponse {
+func (d *peerMsgHandler) newCmdRespFromReq(cmd *raft_cmdpb.RaftCmdRequest, cb *message.Callback) *raft_cmdpb.RaftCmdResponse {
+	req := cmd.Requests[0]
 	resp := newCmdResp()
 	resp.Header.CurrentTerm = d.Term()
 	resp.Responses = []*raft_cmdpb.Response{{CmdType: req.CmdType}}
@@ -81,8 +85,16 @@ func (d *peerMsgHandler) newCmdRespFromReq(req *raft_cmdpb.Request, cb *message.
 		}
 		resp.Responses[0].Get.Value = val
 	case raft_cmdpb.CmdType_Snap:
+		region := d.Region()
+		if cmd.Header.RegionEpoch.Version != region.RegionEpoch.Version {
+			return ErrResp(&util.ErrEpochNotMatch{Regions: []*metapb.Region{region}})
+		}
 		resp.Responses[0].Snap = &raft_cmdpb.SnapResponse{
-			Region: d.Region(),
+			Region: &metapb.Region{
+				Id:       region.Id,
+				StartKey: region.StartKey,
+				EndKey:   region.EndKey,
+			},
 		}
 		cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
 	case raft_cmdpb.CmdType_Put:
@@ -193,17 +205,21 @@ func (d *peerMsgHandler) mayApplyConfChange(ent *pb.Entry) bool {
 	return false
 }
 
-func (d *peerMsgHandler) mayApplySplit(cmd *raft_cmdpb.RaftCmdRequest) {
-	if cmd.Header.RegionEpoch.Version != d.Region().RegionEpoch.Version {
+func (d *peerMsgHandler) mayApplySplit(splCmd *raft_cmdpb.RaftCmdRequest) {
+	if util.IsEpochStale(splCmd.Header.RegionEpoch, d.Region().RegionEpoch) {
 		return
 	}
-	spl := cmd.AdminRequest.Split
+	spl := splCmd.AdminRequest.Split
 	endKey := d.Region().EndKey
 	confVer := d.Region().RegionEpoch.ConfVer
 	version := d.Region().RegionEpoch.Version
 	// update region info :
 	//     one will inherit the metadata before splitting and just modify its Range and RegionEpoch
 	//     while the other will create relevant meta information
+	if engine_util.ExceedEndKey(spl.SplitKey, endKey) ||
+		engine_util.ExceedEndKey(d.Region().StartKey, spl.SplitKey) {
+		return
+	}
 	d.Region().EndKey = spl.SplitKey
 	d.Region().RegionEpoch.Version += 1
 	newRegion := &metapb.Region{
@@ -227,6 +243,7 @@ func (d *peerMsgHandler) mayApplySplit(cmd *raft_cmdpb.RaftCmdRequest) {
 	// register new peer in router and make it start
 	d.ctx.router.register(newPeer)
 	_ = d.ctx.router.send(newRegion.Id, message.Msg{RegionID: newRegion.Id, Type: message.MsgTypeStart})
+	d.splitNewPeer = newPeer
 	// update metadata in ctx
 	sm := d.ctx.storeMeta
 	sm.Lock()
@@ -254,9 +271,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if applySnapResult.PrevRegion.RegionEpoch.ConfVer != applySnapResult.Region.RegionEpoch.ConfVer {
 		d.updateStoreMeta()
 	}
-	region := d.Region()
 	// index applied
-	applied := d.checkApplied(&rd)
+	applied, splitCmd := d.checkApplied(&rd)
 	if d.stopped {
 		return
 	}
@@ -265,17 +281,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		if ent, ok := applied[proposal.index]; ok && ent.Term == proposal.term {
 			cmd := &raft_cmdpb.RaftCmdRequest{}
 			if err = cmd.Unmarshal(ent.Data); err == nil {
-				if cmd.Header.RegionEpoch != nil && cmd.Header.RegionEpoch.Version != region.RegionEpoch.Version {
-					proposal.cb.Done(ErrResp(&util.ErrEpochNotMatch{Regions: []*metapb.Region{region}}))
-					continue
-				}
-				if err := d.checkCommandRegion(cmd); err != nil {
-					log.Warnf("%v check region err %v", d.Tag, err)
-					proposal.cb.Done(ErrResp(err))
-					continue
-				}
 				if len(cmd.Requests) > 0 {
-					resp := d.newCmdRespFromReq(cmd.Requests[0], proposal.cb)
+					resp := d.newCmdRespFromReq(cmd, proposal.cb)
 					proposal.cb.Done(resp)
 					continue
 				}
@@ -291,6 +298,10 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		}
 	}
 	d.proposals = remainedProposals
+	// split
+	if splitCmd != nil {
+		d.mayApplySplit(splitCmd)
+	}
 	// send messages if any
 	for _, msg := range rd.Messages {
 		_ = d.sendRaftMessage(msg, d.ctx.trans)
@@ -390,7 +401,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	//Your Code Here (2B).
-	log.Debugf("%v proposeRaftCommand %v", d.Tag, msg)
+	//log.Debugf("%v proposeRaftCommand %v", d.Tag, msg)
 
 	if err = d.checkCommandRegion(msg); err != nil {
 		log.Debugf("%v check region err", err)
@@ -486,13 +497,11 @@ func (d *peerMsgHandler) handleChangePeer(msg *raft_cmdpb.RaftCmdRequest, cb *me
 }
 
 func (d *peerMsgHandler) handleSplit(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
-	spl := msg.AdminRequest.Split
-	log.Warnf("AdminCmdType_Split %s %v %v", spl.SplitKey, spl.NewRegionId, spl.NewPeerIds)
-	if err := util.CheckKeyInRegionInclusive(spl.SplitKey, d.Region()); err != nil {
-		log.Errorf("split key not in region [%v]", err)
-		cb.Done(ErrResp(err))
+	if d.splitNewPeer != nil && !d.splitNewPeer.stopped && d.splitNewPeer.LeaderId() == raft.None {
 		return
 	}
+	spl := msg.AdminRequest.Split
+	log.Warnf("AdminCmdType_Split %s %v %v", spl.SplitKey, spl.NewRegionId, spl.NewPeerIds)
 	d.mustPropose(msg, cb)
 }
 

@@ -320,8 +320,8 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	for ; i < len(entries) && entries[i].Index <= ps.applyState.AppliedIndex; i++ {
 	}
 	if i > 0 {
-		entries = entries[i:]
 		log.Warnf("Append entries are applied (%v-%v)", entries[0].Index, entries[i-1].Index)
+		entries = entries[i:]
 	}
 	if len(entries) == 0 {
 		return nil
@@ -461,24 +461,19 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		if err = cmd.Unmarshal(ready.CommittedEntries[i].Data); err != nil {
 			log.Panicf("cmd unmarshal error %v", err)
 		}
-		// check region version
-		if cmd.Header.RegionEpoch != nil && cmd.Header.RegionEpoch.Version != ps.region.RegionEpoch.Version {
-			ps.applyState.AppliedIndex = ready.CommittedEntries[i].Index
-			continue
-		}
 		// common request
 		if len(cmd.Requests) > 0 {
 			switch cmd.Requests[0].CmdType {
 			case raft_cmdpb.CmdType_Put:
 				put := cmd.Requests[0].Put
-				if util.CheckKeyInRegion(put.Key, ps.region) == nil {
-					kvWB.SetCF(put.Cf, put.Key, put.Value)
-				}
+				//if util.CheckKeyInRegion(put.Key, ps.region) == nil {
+				kvWB.SetCF(put.Cf, put.Key, put.Value)
+				//}
 			case raft_cmdpb.CmdType_Delete:
 				del := cmd.Requests[0].Delete
-				if util.CheckKeyInRegion(del.Key, ps.region) == nil {
-					kvWB.DeleteCF(del.Cf, del.Key)
-				}
+				//if util.CheckKeyInRegion(del.Key, ps.region) == nil {
+				kvWB.DeleteCF(del.Cf, del.Key)
+				//}
 			}
 			ps.applyState.AppliedIndex = ready.CommittedEntries[i].Index
 			continue
