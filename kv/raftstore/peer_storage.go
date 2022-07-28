@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/Connor1996/badger"
@@ -50,6 +51,21 @@ type PeerStorage struct {
 	Engines *engine_util.Engines
 	// Tag used for logging
 	Tag string
+
+	// state lock
+	applyStatMtx sync.Mutex
+	// CommitCh /  used to apply commited entries asynchronously
+	CommitCh       chan AsyncApplyTask
+	CommitNotifyCh chan AsyncNotifyTask
+}
+
+type AsyncApplyTask struct {
+	entry *eraftpb.Entry
+}
+
+type AsyncNotifyTask struct {
+	entries []*eraftpb.Entry
+	needGC  bool
 }
 
 // NewPeerStorage get the persist raftState from engines and return a peer storage
@@ -127,6 +143,7 @@ func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 		return buf, nil
 	}
 	// Here means we don't fetch enough entries.
+	log.Errorf("%s entries unavailable", ps.Tag)
 	return nil, raft.ErrUnavailable
 }
 
@@ -370,11 +387,16 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return &ApplySnapResult{PrevRegion: prevRegion, Region: ps.region}, nil
 	}
 
+	ps.applyStatMtx.Lock()
+	defer ps.applyStatMtx.Unlock()
+
 	// delete stale data
-	if err := ps.clearMeta(kvWB, raftWB); err != nil {
-		return nil, err
+	if ps.isInitialized() {
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			return nil, err
+		}
+		ps.clearExtraData(snapData.Region)
 	}
-	ps.clearExtraData(snapData.Region)
 
 	ps.raftState.LastIndex = snapshot.Metadata.Index
 	ps.raftState.LastTerm = snapshot.Metadata.Term
@@ -415,50 +437,113 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
-func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
+func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, bool, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
 
 	raftWB := new(engine_util.WriteBatch)
 	kvWB := new(engine_util.WriteBatch)
-	var err error
 
 	// snapshot
 	applySnapResult, err := ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	// append
+	// append; only raft state affected
 	err = ps.Append(ready.Entries, raftWB)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !reflect.DeepEqual(ready.HardState, eraftpb.HardState{}) {
 		ps.raftState.HardState = &ready.HardState
 	}
 	err = raftWB.SetMeta(meta.RaftStateKey(ps.region.GetId()), ps.raftState)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	// apply
-	for i := range ready.CommittedEntries {
-		if ready.CommittedEntries[i].Index <= ps.applyState.AppliedIndex {
+	err = ps.Engines.WriteRaft(raftWB)
+	if err != nil {
+		return nil, false, err
+	}
+	err = ps.Engines.WriteKV(kvWB)
+	if err != nil {
+		return nil, false, err
+	}
+
+	needGC := ps.applyEntries(ready.CommittedEntries)
+
+	// async apply
+	//for i := range ready.CommittedEntries {
+	//	asyncTask := AsyncApplyTask{
+	//		entry: &ready.CommittedEntries[i],
+	//	}
+	//	ps.CommitCh <- asyncTask
+	//}
+
+	return applySnapResult, needGC, nil
+}
+
+//func (ps *PeerStorage) StartAsyncApply() {
+//	go func() {
+//		defer func() {
+//			err := recover()
+//			// has been stopped
+//			log.Errorf("async apply err %v; stop it", err)
+//			close(ps.CommitNotifyCh)
+//		}()
+//		stop := false
+//		for !stop {
+//			taskNum := len(ps.CommitCh)
+//			entries := make([]*eraftpb.Entry, 0, taskNum)
+//			for i := 0; i < taskNum; i += 1 {
+//				task, ok := <-ps.CommitCh
+//				if !ok {
+//					stop = true
+//					break
+//				}
+//				entries = append(entries, task.entry)
+//			}
+//			//ps.Engines
+//			if len(entries) > 0 {
+//				needGC := ps.applyEntries(entries)
+//				ps.CommitNotifyCh <- AsyncNotifyTask{
+//					entries: entries,
+//					needGC:  needGC,
+//				}
+//				time.Sleep(5 * time.Millisecond)
+//			}
+//		}
+//		close(ps.CommitNotifyCh)
+//		return
+//	}()
+//}
+
+func (ps *PeerStorage) applyEntries(entries []eraftpb.Entry) bool {
+	//ps.applyStatMtx.Lock()
+	//defer ps.applyStatMtx.Unlock()
+	if len(entries) == 0 {
+		return false
+	}
+	kvWB := new(engine_util.WriteBatch)
+	needGC := false
+	for i := range entries {
+		if entries[i].Index <= ps.applyState.AppliedIndex {
 			continue
 		}
 		// noop
-		if len(ready.CommittedEntries[i].Data) == 0 {
-			ps.applyState.AppliedIndex = ready.CommittedEntries[i].Index
+		if len(entries[i].Data) == 0 {
+			ps.applyState.AppliedIndex = entries[i].Index
 			continue
 		}
 		// conf change
-		if ready.CommittedEntries[i].EntryType == eraftpb.EntryType_EntryConfChange {
-			ps.applyState.AppliedIndex = ready.CommittedEntries[i].Index
+		if entries[i].EntryType == eraftpb.EntryType_EntryConfChange {
+			ps.applyState.AppliedIndex = entries[i].Index
 			continue
 		}
 		cmd := &raft_cmdpb.RaftCmdRequest{}
-		if err = cmd.Unmarshal(ready.CommittedEntries[i].Data); err != nil {
+		if err := cmd.Unmarshal(entries[i].Data); err != nil {
 			log.Panicf("cmd unmarshal error %v", err)
 		}
 		// common request
@@ -466,16 +551,16 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 			switch cmd.Requests[0].CmdType {
 			case raft_cmdpb.CmdType_Put:
 				put := cmd.Requests[0].Put
-				//if util.CheckKeyInRegion(put.Key, ps.region) == nil {
-				kvWB.SetCF(put.Cf, put.Key, put.Value)
-				//}
+				if util.CheckKeyInRegion(put.Key, ps.region) == nil {
+					kvWB.SetCF(put.Cf, put.Key, put.Value)
+				}
 			case raft_cmdpb.CmdType_Delete:
 				del := cmd.Requests[0].Delete
-				//if util.CheckKeyInRegion(del.Key, ps.region) == nil {
-				kvWB.DeleteCF(del.Cf, del.Key)
-				//}
+				if util.CheckKeyInRegion(del.Key, ps.region) == nil {
+					kvWB.DeleteCF(del.Cf, del.Key)
+				}
 			}
-			ps.applyState.AppliedIndex = ready.CommittedEntries[i].Index
+			ps.applyState.AppliedIndex = entries[i].Index
 			continue
 		}
 		// admin request
@@ -486,28 +571,22 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 				if ps.applyState.TruncatedState.Index < compact.CompactIndex {
 					ps.applyState.TruncatedState.Term = compact.CompactTerm
 					ps.applyState.TruncatedState.Index = compact.CompactIndex
+					needGC = true
 				}
 			}
-			ps.applyState.AppliedIndex = ready.CommittedEntries[i].Index
+			ps.applyState.AppliedIndex = entries[i].Index
 			continue
 		}
-		log.Panicf("unknown commit case %v", ready.CommittedEntries[i])
+		log.Panicf("unknown commit case %v", entries[i])
 	}
-	err = kvWB.SetMeta(meta.ApplyStateKey(ps.region.GetId()), ps.applyState)
-	if err != nil {
-		return nil, err
+	if err := kvWB.SetMeta(meta.ApplyStateKey(ps.region.GetId()), ps.applyState); err != nil {
+		log.Errorf("KV set meta err %v", err)
+		return needGC
 	}
-
-	err = ps.Engines.WriteRaft(raftWB)
-	if err != nil {
-		return nil, err
+	if err := ps.Engines.WriteKV(kvWB); err != nil {
+		log.Errorf("write KV err %v", err)
 	}
-	err = ps.Engines.WriteKV(kvWB)
-	if err != nil {
-		return nil, err
-	}
-
-	return applySnapResult, nil
+	return needGC
 }
 
 func (ps *PeerStorage) ClearData() {

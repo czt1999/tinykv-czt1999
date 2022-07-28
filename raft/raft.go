@@ -105,11 +105,13 @@ func (c *Config) validate() error {
 // Progress represents a follower’s progress in the view of the leader. Leader maintains
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
-	Match, Next uint64
+	Match, Next  uint64
+	recentActive bool
 }
 
 type Raft struct {
-	id uint64
+	RegionID uint64 // for debug
+	id       uint64
 
 	Term uint64
 	Vote uint64
@@ -160,6 +162,8 @@ type Raft struct {
 	PendingConfIndex uint64
 
 	lastSnap *pb.Snapshot
+
+	noActCnt int
 }
 
 // newRaft return a raft peer with the given config
@@ -256,6 +260,9 @@ func (r *Raft) sendHeartbeat(to uint64) {
 }
 
 func (r *Raft) sendSnapshot(to uint64) bool {
+	if !r.Prs[to].recentActive {
+		return false
+	}
 	m := r.newMessage(pb.MessageType_MsgSnapshot, to)
 	if r.lastSnap != nil && r.Prs[to].Next > 1 && r.Prs[to].Next < r.lastSnap.Metadata.Index {
 		log.Warnf("[%v] sendSnapshot %v (using lastSnap) Next %v Last %v", r.id, to, r.Prs[to].Next, r.lastSnap.Metadata.Index)
@@ -274,6 +281,7 @@ func (r *Raft) sendSnapshot(to uint64) bool {
 	m.Snapshot = r.lastSnap
 	r.msgs = append(r.msgs, m)
 	r.Prs[to].Next = m.Snapshot.Metadata.Index + 1
+	r.Prs[to].recentActive = false
 	return true
 }
 
@@ -310,10 +318,12 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
-	r.debug("becomeCandidate %v", r.Prs)
+	//log.Infof("[%v] becomeCandidate %v", r.id, r.Prs)
+	if r.State == StateFollower || r.State == StateCandidate && len(r.votes) > 1 {
+		r.Term += 1
+	}
 	r.State = StateCandidate
 	r.Lead = None
-	r.Term += 1
 	r.Vote = r.id
 	r.votes = make(map[uint64]bool)
 	r.votes[r.id] = true
@@ -326,13 +336,15 @@ func (r *Raft) becomeCandidate() {
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
-	r.debug("becomeLeader")
+	log.Infof("[region %v] new leader %v (Term %v)", r.RegionID, r.id, r.Term)
 	r.State = StateLeader
 	r.Lead = r.id
 	for _, pr := range r.Prs {
 		pr.Match = 0
 		pr.Next = r.RaftLog.LastIndex() + 1
+		pr.recentActive = true
 	}
+	r.noActCnt = 0
 	// noop
 	_ = r.Step(pb.Message{
 		MsgType: pb.MessageType_MsgPropose,
@@ -435,6 +447,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 			r.becomeFollower(m.Term, None)
 			return nil
 		}
+		r.Prs[m.From].recentActive = true
 		if m.Reject {
 			if (m.Index < r.RaftLog.first || m.LogTerm <= r.RaftLog.termBeforeFirst) &&
 				r.lastSnap != nil && r.Prs[m.From].Next == r.lastSnap.Metadata.Index+1 {
@@ -453,11 +466,8 @@ func (r *Raft) stepLeader(m pb.Message) error {
 				r.debug("adjust Next %v -> %v for %v", r.Prs[m.From].Next, toMatch+1, m.From)
 				r.Prs[m.From].Match = toMatch
 				r.Prs[m.From].Next = toMatch + 1
-			} else {
-				r.debug("adjust Next %v -> %v for %v", r.Prs[m.From].Next, r.RaftLog.first-1, m.From)
-				r.Prs[m.From].Next = max(r.RaftLog.first-1, 1)
+				r.sendAppend(m.From)
 			}
-			r.sendAppend(m.From)
 			return nil
 		}
 		r.Prs[m.From].Match = m.Index
@@ -471,7 +481,8 @@ func (r *Raft) stepLeader(m pb.Message) error {
 			r.becomeFollower(m.Term, None)
 			return nil
 		}
-		if m.LogTerm == r.Term {
+		r.Prs[m.From].recentActive = true
+		if m.LogTerm == r.RaftLog.LastTerm() {
 			r.Prs[m.From].Match = m.Index
 			if m.Index == r.RaftLog.LastIndex() {
 				return nil
@@ -485,26 +496,32 @@ func (r *Raft) stepLeader(m pb.Message) error {
 				r.Prs[m.From].Next = m.Index + 1
 				return nil
 			}
+			if m.Index >= r.RaftLog.first {
+				t, _ := r.RaftLog.Term(m.Index)
+				if t == m.LogTerm {
+					r.Prs[m.From].Match = m.Index
+				}
+			}
 			r.Prs[m.From].Next = m.Index + 1
 			r.sendAppend(m.From)
 			return nil
 		}
 		// old leader (higher index, lower term)
-		if m.LogTerm < r.Term {
-			toMatch := r.RaftLog.LastIndex() - 1
-			for t, _ := r.RaftLog.Term(toMatch); t != m.LogTerm && toMatch >= r.RaftLog.first; toMatch -= 1 {
-				t, _ = r.RaftLog.Term(toMatch)
-			}
-			if toMatch >= r.RaftLog.first {
-				r.debug("adjust Next %v -> %v for %v", r.Prs[m.From].Next, toMatch+1, m.From)
-				r.Prs[m.From].Match = toMatch
-				r.Prs[m.From].Next = toMatch + 1
-			} else {
-				r.debug("adjust Next %v -> %v for %v", r.Prs[m.From].Next, r.RaftLog.first-1, m.From)
-				r.Prs[m.From].Next = max(r.RaftLog.first-1, 1)
-			}
-			r.sendAppend(m.From)
-		}
+		//if m.LogTerm < r.Term {
+		//	toMatch := r.RaftLog.LastIndex() - 1
+		//	for t, _ := r.RaftLog.Term(toMatch); t != m.LogTerm && toMatch >= r.RaftLog.first; toMatch -= 1 {
+		//		t, _ = r.RaftLog.Term(toMatch)
+		//	}
+		//	if toMatch >= r.RaftLog.first {
+		//		r.debug("adjust Next %v -> %v for %v", r.Prs[m.From].Next, toMatch+1, m.From)
+		//		r.Prs[m.From].Match = toMatch
+		//		r.Prs[m.From].Next = toMatch + 1
+		//	} else {
+		//		r.debug("adjust Next %v -> %v for %v", r.Prs[m.From].Next, r.RaftLog.first-1, m.From)
+		//		r.Prs[m.From].Next = max(r.RaftLog.first-1, 1)
+		//	}
+		//	r.sendAppend(m.From)
+		//}
 	case pb.MessageType_MsgHeartbeat, pb.MessageType_MsgAppend:
 		if m.Term > r.Term {
 			r.becomeFollower(m.Term, None)
@@ -585,10 +602,25 @@ func (r *Raft) handleHup(m pb.Message) {
 
 // handleBeat handle MsgBeat
 func (r *Raft) handleBeat(m pb.Message) {
+	actCnt := 0
 	for peer := range r.Prs {
 		if peer != r.id {
+			if r.Prs[peer].recentActive {
+				actCnt += 1
+				r.Prs[peer].recentActive = false
+			}
 			r.sendHeartbeat(peer)
 		}
+	}
+	if actCnt == 0 {
+		r.noActCnt += 1
+	} else {
+		r.noActCnt = 0
+	}
+	if r.noActCnt == 50 {
+		log.Warnf("[%v] actively converts to follower", r.id)
+		r.noActCnt = 0
+		r.becomeFollower(r.Term+1, None)
 	}
 	r.heartbeatElapsed = -r.heartbeatTimeout
 }

@@ -279,7 +279,41 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
+	epoch := region.GetRegionEpoch()
 
+	if epoch == nil {
+		log.Warn("epoch is nil")
+		return nil
+	}
+
+	// cannot trust every heartbeat :
+	// if the cluster has partitions in a certain section,
+	// the information about some nodes might be wrong
+	c.core.Lock()
+	originRegion := c.core.Regions.GetRegion(region.GetID())
+	if originRegion != nil {
+		originEpoch := originRegion.GetRegionEpoch()
+		if epoch.Version < originEpoch.Version || epoch.ConfVer < originEpoch.ConfVer {
+			// heartbeat region is stale
+			c.core.Unlock()
+			return ErrRegionIsStale(region.GetMeta(), originRegion.GetMeta())
+		}
+	}
+	overlaps := c.core.Regions.GetOverlaps(region)
+	for _, r := range overlaps {
+		overlapEpoch := r.GetRegionEpoch()
+		if overlapEpoch != nil && (epoch.Version < overlapEpoch.Version || epoch.ConfVer < overlapEpoch.ConfVer) {
+			// heartbeat region is stale
+			c.core.Unlock()
+			return ErrRegionIsStale(region.GetMeta(), r.GetMeta())
+		}
+	}
+	c.core.Unlock()
+	// to update related store’s status (such as leader count, region count, pending peer count… ).
+	c.core.PutRegion(region)
+	for _, store := range c.GetMetaStores() {
+		c.updateStoreStatusLocked(store.Id)
+	}
 	return nil
 }
 

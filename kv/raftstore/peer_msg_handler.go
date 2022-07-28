@@ -32,8 +32,7 @@ const (
 
 type peerMsgHandler struct {
 	*peer
-	ctx          *GlobalContext
-	splitNewPeer *peer
+	ctx *GlobalContext
 }
 
 func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
@@ -43,17 +42,17 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
-func (d *peerMsgHandler) checkApplied(rd *raft.Ready) (map[uint64]*pb.Entry, *raft_cmdpb.RaftCmdRequest) {
+func (d *peerMsgHandler) checkApplied(entries []pb.Entry) (map[uint64]*pb.Entry, uint64) {
 	applied := make(map[uint64]*pb.Entry, 0)
-	var split *raft_cmdpb.RaftCmdRequest
-	for i := range rd.CommittedEntries {
-		ent := rd.CommittedEntries[i]
-		applied[ent.Index] = &ent
+	var highestCmtIdx uint64
+	for i := range entries {
+		ent := &entries[i]
+		applied[ent.Index] = ent
 		if len(ent.Data) == 0 {
 			continue
 		}
 		// check conf change
-		needDestroy := d.mayApplyConfChange(&ent)
+		needDestroy := d.mayApplyConfChange(ent)
 		if needDestroy {
 			d.destroyPeer()
 			break
@@ -62,39 +61,35 @@ func (d *peerMsgHandler) checkApplied(rd *raft.Ready) (map[uint64]*pb.Entry, *ra
 		cmd := &raft_cmdpb.RaftCmdRequest{}
 		if err := cmd.Unmarshal(ent.Data); err == nil {
 			if cmd.AdminRequest != nil && cmd.AdminRequest.Split != nil {
-				split = cmd
-				//d.mayApplySplit(split)
+				d.mayApplySplit(cmd)
 			}
 		}
+		if i == len(entries)-1 {
+			highestCmtIdx = ent.Index
+		}
 	}
-	return applied, split
+	return applied, highestCmtIdx
 }
 
-func (d *peerMsgHandler) newCmdRespFromReq(cmd *raft_cmdpb.RaftCmdRequest, cb *message.Callback) *raft_cmdpb.RaftCmdResponse {
+func (d *peerMsgHandler) processCmdReq(cmd *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	req := cmd.Requests[0]
+	region := d.Region()
+	if cmd.Header.RegionEpoch.Version != region.RegionEpoch.Version {
+		time.Sleep(100 * time.Millisecond)
+		cb.Done(ErrResp(&util.ErrEpochNotMatch{Regions: []*metapb.Region{region}}))
+		return
+	}
 	resp := newCmdResp()
 	resp.Header.CurrentTerm = d.Term()
 	resp.Responses = []*raft_cmdpb.Response{{CmdType: req.CmdType}}
 	switch req.CmdType {
 	case raft_cmdpb.CmdType_Get:
 		resp.Responses[0].Get = &raft_cmdpb.GetResponse{}
-		val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, engine_util.CfDefault, req.Get.Key)
-		if err != nil {
-			log.Errorf("Request Get error %v", err)
-			return resp
-		}
+		val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, engine_util.CfDefault, req.Get.Key)
 		resp.Responses[0].Get.Value = val
 	case raft_cmdpb.CmdType_Snap:
-		region := d.Region()
-		if cmd.Header.RegionEpoch.Version != region.RegionEpoch.Version {
-			return ErrResp(&util.ErrEpochNotMatch{Regions: []*metapb.Region{region}})
-		}
 		resp.Responses[0].Snap = &raft_cmdpb.SnapResponse{
-			Region: &metapb.Region{
-				Id:       region.Id,
-				StartKey: region.StartKey,
-				EndKey:   region.EndKey,
-			},
+			Region: &metapb.Region{Id: region.Id, StartKey: region.StartKey, EndKey: region.EndKey},
 		}
 		cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
 	case raft_cmdpb.CmdType_Put:
@@ -102,7 +97,7 @@ func (d *peerMsgHandler) newCmdRespFromReq(cmd *raft_cmdpb.RaftCmdRequest, cb *m
 	case raft_cmdpb.CmdType_Delete:
 		resp.Responses[0].Delete = &raft_cmdpb.DeleteResponse{}
 	}
-	return resp
+	cb.Done(resp)
 }
 
 func (d *peerMsgHandler) addRegionPeer(peerId uint64, storeId uint64) {
@@ -145,15 +140,15 @@ func (d *peerMsgHandler) updateStoreMeta() {
 	sm.Unlock()
 }
 
-func (d *peerMsgHandler) saveRegionState(region *metapb.Region) {
+func (d *peerMsgHandler) saveRegionState(regions []*metapb.Region) {
 	kvWB := new(engine_util.WriteBatch)
-	regionState := &rspb.RegionLocalState{State: rspb.PeerState_Normal, Region: region}
-	err := kvWB.SetMeta(meta.RegionStateKey(region.Id), regionState)
-	if err != nil {
-		panic(err)
+	for _, r := range regions {
+		regionState := &rspb.RegionLocalState{State: rspb.PeerState_Normal, Region: r}
+		if err := kvWB.SetMeta(meta.RegionStateKey(r.Id), regionState); err != nil {
+			panic(err)
+		}
 	}
-	err = d.peerStorage.Engines.WriteKV(kvWB)
-	if err != nil {
+	if err := d.peerStorage.Engines.WriteKV(kvWB); err != nil {
 		panic(err)
 	}
 }
@@ -180,11 +175,15 @@ func (d *peerMsgHandler) mayApplyConfChange(ent *pb.Entry) bool {
 		}
 		return false
 	}
-	log.Warnf("[%v] apply conf change (index %v epoch %v) %v", d.PeerId(), ent.Index, d.Region().RegionEpoch.ConfVer+1, cc)
+	log.Warnf("%s apply conf change (index %v epoch %v) %v", d.Tag, ent.Index, d.Region().RegionEpoch.ConfVer+1, cc)
 	switch cc.ChangeType {
 	case pb.ConfChangeType_AddNode:
 		d.addRegionPeer(cc.NodeId, req.AdminRequest.ChangePeer.Peer.StoreId)
 	case pb.ConfChangeType_RemoveNode:
+		if cc.NodeId == d.LeaderId() {
+			log.Warnf("%s remove leader rejected (index %v epoch %v)", d.Tag, ent.Index, d.Region().RegionEpoch.ConfVer+1)
+			return false
+		}
 		d.removeRegionPeer(cc.NodeId)
 		if cc.NodeId == d.Meta.Id {
 			return true
@@ -193,7 +192,7 @@ func (d *peerMsgHandler) mayApplyConfChange(ent *pb.Entry) bool {
 	d.writeRegionState()
 	d.updateStoreMeta()
 	_ = d.RaftGroup.ApplyConfChange(cc)
-	log.Warnf("[%v] apply conf change (index %v epoch %v) -> %v", d.PeerId(), ent.Index, d.Region().RegionEpoch.ConfVer, d.RaftGroup.Raft.Prs)
+	log.Warnf("[%v] apply conf change (index %v epoch %+v) -> %v", d.PeerId(), ent.Index, d.Region().RegionEpoch, d.RaftGroup.Raft.Prs)
 	// callback
 	for _, proposal := range d.proposals {
 		if proposal.index == ent.Index && proposal.term == ent.Term {
@@ -206,22 +205,26 @@ func (d *peerMsgHandler) mayApplyConfChange(ent *pb.Entry) bool {
 }
 
 func (d *peerMsgHandler) mayApplySplit(splCmd *raft_cmdpb.RaftCmdRequest) {
-	if util.IsEpochStale(splCmd.Header.RegionEpoch, d.Region().RegionEpoch) {
+	spl := splCmd.AdminRequest.Split
+	oldRegion := d.Region()
+	if splCmd.Header.RegionEpoch.Version != oldRegion.RegionEpoch.Version {
 		return
 	}
-	spl := splCmd.AdminRequest.Split
-	endKey := d.Region().EndKey
-	confVer := d.Region().RegionEpoch.ConfVer
-	version := d.Region().RegionEpoch.Version
+	if len(spl.NewPeerIds) != len(oldRegion.Peers) {
+		log.Warnf("len(spl.NewPeerIds) %v != len(oldRegion.Peers) %v", len(spl.NewPeerIds), len(oldRegion.Peers))
+		return
+	}
+	if engine_util.ExceedEndKey(spl.SplitKey, oldRegion.EndKey) ||
+		engine_util.ExceedEndKey(oldRegion.StartKey, spl.SplitKey) {
+		return
+	}
+	endKey := oldRegion.EndKey
+	confVer, version := oldRegion.RegionEpoch.ConfVer, oldRegion.RegionEpoch.Version
 	// update region info :
 	//     one will inherit the metadata before splitting and just modify its Range and RegionEpoch
 	//     while the other will create relevant meta information
-	if engine_util.ExceedEndKey(spl.SplitKey, endKey) ||
-		engine_util.ExceedEndKey(d.Region().StartKey, spl.SplitKey) {
-		return
-	}
-	d.Region().EndKey = spl.SplitKey
-	d.Region().RegionEpoch.Version += 1
+	oldRegion.RegionEpoch.Version += 1
+	oldRegion.EndKey = spl.SplitKey
 	newRegion := &metapb.Region{
 		Id:          spl.NewRegionId,
 		StartKey:    spl.SplitKey,
@@ -229,30 +232,32 @@ func (d *peerMsgHandler) mayApplySplit(splCmd *raft_cmdpb.RaftCmdRequest) {
 		RegionEpoch: &metapb.RegionEpoch{ConfVer: confVer, Version: version + 1},
 		Peers:       make([]*metapb.Peer, len(spl.NewPeerIds)),
 	}
-	for i, p := range d.Region().Peers {
+	for i, p := range oldRegion.Peers {
 		newRegion.Peers[i] = &metapb.Peer{
 			Id:      spl.NewPeerIds[i],
 			StoreId: p.StoreId,
 		}
 	}
+	d.saveRegionState([]*metapb.Region{oldRegion, newRegion})
 	// create peer
 	newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
 	if err != nil {
 		log.Panicf("create peer err %v", err)
 	}
-	// register new peer in router and make it start
-	d.ctx.router.register(newPeer)
-	_ = d.ctx.router.send(newRegion.Id, message.Msg{RegionID: newRegion.Id, Type: message.MsgTypeStart})
-	d.splitNewPeer = newPeer
 	// update metadata in ctx
 	sm := d.ctx.storeMeta
 	sm.Lock()
 	sm.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
 	sm.regions[newRegion.Id] = newRegion
 	sm.Unlock()
-	// save region state
-	d.saveRegionState(d.Region())
-	d.saveRegionState(newRegion)
+	// register new peer in router and make it start
+	d.ctx.router.register(newPeer)
+	_ = d.ctx.router.send(newRegion.Id, message.Msg{RegionID: newRegion.Id, Type: message.MsgTypeStart})
+	if d.IsLeader() {
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+		newPeer.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+	}
+	log.Infof("%s split -> [%s, %s) [%s, %s) %s", d.Tag, oldRegion.StartKey, oldRegion.EndKey, newRegion.StartKey, newRegion.EndKey, newPeer.Tag)
 }
 
 func (d *peerMsgHandler) HandleRaftReady() {
@@ -261,9 +266,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 	// Your Code Here (2B).
 	rd := d.RaftGroup.Ready()
-	prevTruncatedIndex := d.peerStorage.applyState.TruncatedState.Index
 	// persist states and entries and apply entries if any
-	applySnapResult, err := d.peerStorage.SaveReadyState(&rd)
+	applySnapResult, needGC, err := d.peerStorage.SaveReadyState(&rd)
 	if err != nil {
 		panic(err)
 	}
@@ -271,47 +275,47 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if applySnapResult.PrevRegion.RegionEpoch.ConfVer != applySnapResult.Region.RegionEpoch.ConfVer {
 		d.updateStoreMeta()
 	}
-	// index applied
-	applied, splitCmd := d.checkApplied(&rd)
-	if d.stopped {
-		return
-	}
-	remainedProposals := make([]*proposal, 0)
-	for _, proposal := range d.proposals {
-		if ent, ok := applied[proposal.index]; ok && ent.Term == proposal.term {
-			cmd := &raft_cmdpb.RaftCmdRequest{}
-			if err = cmd.Unmarshal(ent.Data); err == nil {
-				if len(cmd.Requests) > 0 {
-					resp := d.newCmdRespFromReq(cmd, proposal.cb)
-					proposal.cb.Done(resp)
-					continue
-				}
-			}
-		} else if ok && ent.Term != proposal.term {
-			// leader may have been changed
-			regionID := d.regionId
-			leaderID := d.LeaderId()
-			leader := d.getPeerFromCache(leaderID)
-			proposal.cb.Done(ErrResp(&util.ErrNotLeader{RegionId: regionID, Leader: leader}))
-		} else {
-			remainedProposals = append(remainedProposals, proposal)
-		}
-	}
-	d.proposals = remainedProposals
-	// split
-	if splitCmd != nil {
-		d.mayApplySplit(splitCmd)
+	// region split applied by snapshot
+	if applySnapResult.PrevRegion.RegionEpoch.Version != applySnapResult.Region.RegionEpoch.Version {
+		d.updateStoreMeta()
 	}
 	// send messages if any
 	for _, msg := range rd.Messages {
 		_ = d.sendRaftMessage(msg, d.ctx.trans)
 	}
-	// schedule gc if necessary
-	truncatedIndex := d.peerStorage.applyState.TruncatedState.Index
-	if len(rd.CommittedEntries) > 0 && truncatedIndex > prevTruncatedIndex {
-		d.ScheduleCompactLog(truncatedIndex)
+	d.postprocessApplied(rd.CommittedEntries)
+	if needGC {
+		d.ScheduleCompactLog(d.peerStorage.applyState.TruncatedState.Index)
 	}
 	d.RaftGroup.Advance(rd)
+}
+
+func (d *peerMsgHandler) postprocessApplied(entries []pb.Entry) {
+	applied, highestCmtIdx := d.checkApplied(entries)
+	//log.Infof("%s check #%v applied highest commit %v", d.Tag, len(task.entries), highestCmtIdx)
+	if d.stopped {
+		return
+	}
+	remainedProposals := make([]*proposal, 0)
+	for _, proposal := range d.proposals {
+		if proposal == nil {
+			log.Panicf("%s proposal nil", d.Tag)
+		}
+		if ent, ok := applied[proposal.index]; ok && ent.Term == proposal.term {
+			cmd := &raft_cmdpb.RaftCmdRequest{}
+			if err := cmd.Unmarshal(ent.Data); err == nil {
+				if len(cmd.Requests) > 0 {
+					go d.processCmdReq(cmd, proposal.cb)
+					continue
+				}
+			}
+		} else if ok && ent.Term != proposal.term {
+			proposal.cb.Done(ErrRespStaleCommand(d.Term()))
+		} else if proposal.index > highestCmtIdx {
+			remainedProposals = append(remainedProposals, proposal)
+		}
+	}
+	d.proposals = remainedProposals
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -328,7 +332,6 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 		d.onTick()
 	case message.MsgTypeSplitRegion:
 		split := msg.Data.(*message.MsgSplitRegion)
-		log.Infof("%s on split with %v", d.Tag, split.SplitKey)
 		d.onPrepareSplitRegion(split.RegionEpoch, split.SplitKey, split.Callback)
 	case message.MsgTypeRegionApproximateSize:
 		d.onApproximateRegionSize(msg.Data.(uint64))
@@ -404,7 +407,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	//log.Debugf("%v proposeRaftCommand %v", d.Tag, msg)
 
 	if err = d.checkCommandRegion(msg); err != nil {
-		log.Debugf("%v check region err", err)
+		log.Warnf("%v check region err", err)
 		cb.Done(ErrResp(err))
 		return
 	}
@@ -445,11 +448,8 @@ func (d peerMsgHandler) mustPropose(msg *raft_cmdpb.RaftCmdRequest, cb *message.
 }
 
 func (d *peerMsgHandler) appendNewProposal(cb *message.Callback) {
-	d.proposals = append(d.proposals, &proposal{
-		index: d.nextProposalIndex(),
-		term:  d.Term(),
-		cb:    cb,
-	})
+	p := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
+	d.proposals = append(d.proposals, p)
 }
 
 func (d *peerMsgHandler) handleTransferLeader(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
@@ -480,7 +480,7 @@ func (d *peerMsgHandler) handleChangePeer(msg *raft_cmdpb.RaftCmdRequest, cb *me
 		// remove leader
 		maybeTransferee := d.RaftGroup.Raft.PeerMaybeTransferee()
 		if maybeTransferee != raft.None {
-			cb.Done(ErrResp(errors.New("target peer is leader, transfer pending")))
+			//cb.Done(ErrResp(errors.New("target peer is leader, transfer pending")))
 			log.Warnf("target peer is leader %v, transfer to %v", d.PeerId(), maybeTransferee)
 			d.RaftGroup.TransferLeader(maybeTransferee)
 			return
@@ -497,11 +497,13 @@ func (d *peerMsgHandler) handleChangePeer(msg *raft_cmdpb.RaftCmdRequest, cb *me
 }
 
 func (d *peerMsgHandler) handleSplit(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
-	if d.splitNewPeer != nil && !d.splitNewPeer.stopped && d.splitNewPeer.LeaderId() == raft.None {
+	spl := msg.AdminRequest.Split
+	if engine_util.ExceedEndKey(spl.SplitKey, d.Region().EndKey) ||
+		engine_util.ExceedEndKey(d.Region().StartKey, spl.SplitKey) {
 		return
 	}
-	spl := msg.AdminRequest.Split
-	log.Warnf("AdminCmdType_Split %s %v %v", spl.SplitKey, spl.NewRegionId, spl.NewPeerIds)
+	//d.pendingSplitVer = msg.Header.RegionEpoch.Version
+	log.Warnf("%s AdminCmdType_Split %s %v %v", d.Tag, spl.SplitKey, spl.NewRegionId, spl.NewPeerIds)
 	d.mustPropose(msg, cb)
 }
 
