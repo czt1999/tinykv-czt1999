@@ -114,8 +114,13 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		return txn.Reader.GetCF(engine_util.CfDefault,
-			EncodeKey(key, write.StartTS))
+		if write.Kind == WriteKindPut {
+			return txn.Reader.GetCF(engine_util.CfDefault,
+				EncodeKey(key, write.StartTS))
+		}
+		if write.Kind == WriteKindDelete {
+			return nil, nil
+		}
 	}
 	return nil, nil
 }
@@ -156,7 +161,7 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 			break
 		}
 		commitTS := decodeTimestamp(i.Key())
-		if txn.StartTS >= commitTS {
+		if txn.StartTS > commitTS {
 			break
 		}
 		wval, err := i.Value()
