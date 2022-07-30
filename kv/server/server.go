@@ -86,6 +86,13 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 	}
 	startTS := req.StartVersion
 	txn := mvcc.NewMvccTxn(reader, startTS)
+	keys := make([][]byte, len(req.Mutations))
+	for i, mut := range req.Mutations {
+		keys[i] = mut.Key
+	}
+	lat := latches.NewLatches()
+	lat.WaitForLatches(keys)
+	defer lat.ReleaseLatches(keys)
 	for _, mut := range req.Mutations {
 		lock, err := txn.GetLock(mut.Key)
 		if err != nil {
@@ -130,6 +137,9 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 	}
 	startTS, commitTS := req.StartVersion, req.CommitVersion
 	txn := mvcc.NewMvccTxn(reader, commitTS)
+	lat := latches.NewLatches()
+	lat.WaitForLatches(req.Keys)
+	defer lat.ReleaseLatches(req.Keys)
 	for _, key := range req.Keys {
 		write, recentCommitTS, err := txn.MostRecentWrite(key)
 		if err != nil {
@@ -223,6 +233,11 @@ func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnS
 		return resp, err
 	}
 	key, ts := req.PrimaryKey, req.CurrentTs
+
+	lat := latches.NewLatches()
+	lat.WaitForLatches([][]byte{key})
+	defer lat.ReleaseLatches([][]byte{key})
+
 	txn := mvcc.NewMvccTxn(reader, ts)
 	lock, err := txn.GetLock(key)
 	if err != nil {
@@ -277,6 +292,11 @@ func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollb
 	}
 	ts := req.StartVersion
 	txn := mvcc.NewMvccTxn(reader, ts)
+
+	lat := latches.NewLatches()
+	lat.WaitForLatches(req.Keys)
+	defer lat.ReleaseLatches(req.Keys)
+
 	for _, key := range req.Keys {
 		// checks that a key is locked by the current transaction,
 		// and if so removes the lock, deletes any value and leaves a rollback indicator as a write
@@ -322,28 +342,37 @@ func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockR
 	startTS, commitTS := req.StartVersion, req.CommitVersion
 	txn := mvcc.NewMvccTxn(reader, startTS)
 	// inspects a batch of locked keys and either rolls them all back or commits them all.
+	keys := make([][]byte, 0)
 	iter := reader.IterCF(engine_util.CfLock)
 	for ; iter.Valid(); iter.Next() {
 		i := iter.Item()
 		rval, _ := i.Value()
 		lock, _ := mvcc.ParseLock(rval)
 		if lock.Ts == startTS {
-			key := i.Key()
-			txn.DeleteLock(key)
-			if commitTS > 0 {
-				txn.PutWrite(key, commitTS, &mvcc.Write{
-					StartTS: startTS,
-					Kind:    mvcc.WriteKindPut,
-				})
-			} else {
-				txn.DeleteValue(key)
-				txn.PutWrite(key, startTS, &mvcc.Write{
-					StartTS: startTS,
-					Kind:    mvcc.WriteKindRollback,
-				})
-			}
+			keys = append(keys, i.Key())
 		}
 	}
+
+	lat := latches.NewLatches()
+	lat.WaitForLatches(keys)
+	defer lat.ReleaseLatches(keys)
+
+	for _, key := range keys {
+		txn.DeleteLock(key)
+		if commitTS > 0 {
+			txn.PutWrite(key, commitTS, &mvcc.Write{
+				StartTS: startTS,
+				Kind:    mvcc.WriteKindPut,
+			})
+		} else {
+			txn.DeleteValue(key)
+			txn.PutWrite(key, startTS, &mvcc.Write{
+				StartTS: startTS,
+				Kind:    mvcc.WriteKindRollback,
+			})
+		}
+	}
+
 	if err = server.storage.Write(req.Context, txn.Writes()); err != nil {
 		return resp, err
 	}
