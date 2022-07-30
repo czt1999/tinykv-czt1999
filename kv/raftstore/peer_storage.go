@@ -97,8 +97,8 @@ func (ps *PeerStorage) InitialState() (eraftpb.HardState, eraftpb.ConfState, err
 	raftState := ps.raftState
 	if raft.IsEmptyHardState(*raftState.HardState) {
 		y.AssertTruef(!ps.isInitialized(),
-			"peer for region %s is initialized but local state %+v has empty hard state",
-			ps.region, ps.raftState)
+			"%s peer for region %s is initialized but local state %+v has empty hard state",
+			ps.Tag, ps.region, ps.raftState)
 		return eraftpb.HardState{}, eraftpb.ConfState{}, nil
 	}
 	return *raftState.HardState, util.ConfStateFromRegion(ps.region), nil
@@ -474,51 +474,8 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, bool
 
 	needGC := ps.applyEntries(ready.CommittedEntries)
 
-	// async apply
-	//for i := range ready.CommittedEntries {
-	//	asyncTask := AsyncApplyTask{
-	//		entry: &ready.CommittedEntries[i],
-	//	}
-	//	ps.CommitCh <- asyncTask
-	//}
-
 	return applySnapResult, needGC, nil
 }
-
-//func (ps *PeerStorage) StartAsyncApply() {
-//	go func() {
-//		defer func() {
-//			err := recover()
-//			// has been stopped
-//			log.Errorf("async apply err %v; stop it", err)
-//			close(ps.CommitNotifyCh)
-//		}()
-//		stop := false
-//		for !stop {
-//			taskNum := len(ps.CommitCh)
-//			entries := make([]*eraftpb.Entry, 0, taskNum)
-//			for i := 0; i < taskNum; i += 1 {
-//				task, ok := <-ps.CommitCh
-//				if !ok {
-//					stop = true
-//					break
-//				}
-//				entries = append(entries, task.entry)
-//			}
-//			//ps.Engines
-//			if len(entries) > 0 {
-//				needGC := ps.applyEntries(entries)
-//				ps.CommitNotifyCh <- AsyncNotifyTask{
-//					entries: entries,
-//					needGC:  needGC,
-//				}
-//				time.Sleep(5 * time.Millisecond)
-//			}
-//		}
-//		close(ps.CommitNotifyCh)
-//		return
-//	}()
-//}
 
 func (ps *PeerStorage) applyEntries(entries []eraftpb.Entry) bool {
 	//ps.applyStatMtx.Lock()

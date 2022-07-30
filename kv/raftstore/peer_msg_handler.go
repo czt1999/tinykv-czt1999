@@ -225,6 +225,15 @@ func (d *peerMsgHandler) mayApplySplit(splCmd *raft_cmdpb.RaftCmdRequest) {
 	//     while the other will create relevant meta information
 	oldRegion.RegionEpoch.Version += 1
 	oldRegion.EndKey = spl.SplitKey
+	// check if new peer is already created
+	sm := d.ctx.storeMeta
+	sm.Lock()
+	defer sm.Unlock()
+	if _, ok := sm.regions[spl.NewRegionId]; ok {
+		log.Warnf("region %v store %v peer already created", spl.NewRegionId, d.storeID())
+		d.saveRegionState([]*metapb.Region{oldRegion})
+		return
+	}
 	newRegion := &metapb.Region{
 		Id:          spl.NewRegionId,
 		StartKey:    spl.SplitKey,
@@ -245,11 +254,8 @@ func (d *peerMsgHandler) mayApplySplit(splCmd *raft_cmdpb.RaftCmdRequest) {
 		log.Panicf("create peer err %v", err)
 	}
 	// update metadata in ctx
-	sm := d.ctx.storeMeta
-	sm.Lock()
 	sm.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
 	sm.regions[newRegion.Id] = newRegion
-	sm.Unlock()
 	// register new peer in router and make it start
 	d.ctx.router.register(newPeer)
 	_ = d.ctx.router.send(newRegion.Id, message.Msg{RegionID: newRegion.Id, Type: message.MsgTypeStart})
@@ -257,7 +263,8 @@ func (d *peerMsgHandler) mayApplySplit(splCmd *raft_cmdpb.RaftCmdRequest) {
 		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
 		newPeer.HeartbeatScheduler(d.ctx.schedulerTaskSender)
 	}
-	log.Infof("%s split -> [%s, %s) [%s, %s) %s", d.Tag, oldRegion.StartKey, oldRegion.EndKey, newRegion.StartKey, newRegion.EndKey, newPeer.Tag)
+	log.Infof("%s split -> [%s, %s) [%s, %s) %s (store: %v)",
+		d.Tag, oldRegion.StartKey, oldRegion.EndKey, newRegion.StartKey, newRegion.EndKey, newPeer.Tag, d.storeID())
 }
 
 func (d *peerMsgHandler) HandleRaftReady() {
