@@ -74,6 +74,7 @@ type RawNode struct {
 	lastAdvc       uint64
 	lastHs         pb.HardState
 	lastSs         SoftState
+	lastMsgLen     int
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
@@ -158,6 +159,7 @@ func (rn *RawNode) Ready() Ready {
 	}
 	if len(rn.Raft.msgs) > 0 {
 		rd.Messages = rn.Raft.msgs
+		rn.lastMsgLen = len(rn.Raft.msgs)
 	}
 	if rn.Raft.RaftLog.pendingSnapshot != nil {
 		rd.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
@@ -169,7 +171,7 @@ func (rn *RawNode) Ready() Ready {
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
-	return len(rn.Raft.msgs) > 0 || rn.lastAdvc < rn.Raft.RaftLog.LastIndex() || rn.lastAdvcCommit < rn.Raft.RaftLog.committed
+	return len(rn.Raft.msgs)-rn.lastMsgLen > 0 || rn.lastAdvc < rn.Raft.RaftLog.LastIndex() || rn.lastAdvcCommit < rn.Raft.RaftLog.committed
 }
 
 // Advance notifies the RawNode that the application has applied and saved progress in the
@@ -195,8 +197,9 @@ func (rn *RawNode) Advance(rd Ready) {
 	}
 	if len(rd.Messages) > 0 {
 		newMsgs := make([]pb.Message, len(rn.Raft.msgs)-len(rd.Messages))
-		copy(newMsgs, rd.Messages)
+		copy(newMsgs, rn.Raft.msgs[len(rd.Messages):])
 		rn.Raft.msgs = newMsgs
+		rn.lastMsgLen = 0
 	}
 	if rd.Snapshot.Metadata != nil && rn.Raft.RaftLog.pendingSnapshot != nil {
 		snapshot := *rn.Raft.RaftLog.pendingSnapshot

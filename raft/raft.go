@@ -319,9 +319,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	//log.Infof("[%v] becomeCandidate %v", r.id, r.Prs)
-	if r.State == StateFollower || r.State == StateCandidate && len(r.votes) > 1 {
-		r.Term += 1
-	}
+	r.Term += 1
 	r.State = StateCandidate
 	r.Lead = None
 	r.Vote = r.id
@@ -462,7 +460,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 				// ajusted, skip
 				return nil
 			}
-			if toMatch >= r.RaftLog.first {
+			if toMatch+1 >= r.RaftLog.first {
 				r.debug("adjust Next %v -> %v for %v", r.Prs[m.From].Next, toMatch+1, m.From)
 				r.Prs[m.From].Match = toMatch
 				r.Prs[m.From].Next = toMatch + 1
@@ -524,7 +522,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		//}
 	case pb.MessageType_MsgHeartbeat, pb.MessageType_MsgAppend:
 		if m.Term > r.Term {
-			r.becomeFollower(m.Term, None)
+			r.becomeFollower(m.Term, m.From)
 		}
 	case pb.MessageType_MsgSnapshot:
 		if m.Term > r.Term {
@@ -720,7 +718,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			r.msgs = append(r.msgs, r.newMessageWithLogTermAndIndex(pb.MessageType_MsgAppendResponse, m.From))
 			return
 		}
-		r.debug("handleAppend invalid index/term (%v/%v) here (-/%v) first %v last (%v/%v) %v", m.Index, m.LogTerm, prevTerm, r.RaftLog.first, r.RaftLog.LastIndex(), r.RaftLog.LastTerm(), len(r.RaftLog.entries))
+		r.debug("handleAppend invalid index/term (%v/%v) here (%v/%v) first %v last (%v/%v) %v",
+			m.Index, m.LogTerm, r.RaftLog.LastIndex(), prevTerm, r.RaftLog.first, r.RaftLog.LastIndex(), r.RaftLog.LastTerm(), len(r.RaftLog.entries))
 	}
 	//r.debug("handleAppend invalid index/term (%v/%v) here (%v/%v)", m.Index, m.LogTerm, r.RaftLog.LastIndex(), r.RaftLog.LastTerm())
 	// tell the leader to decrease Next

@@ -272,6 +272,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	if !d.RaftGroup.HasReady() {
+		return
+	}
 	rd := d.RaftGroup.Ready()
 	// persist states and entries and apply entries if any
 	applySnapResult, needGC, err := d.peerStorage.SaveReadyState(&rd)
